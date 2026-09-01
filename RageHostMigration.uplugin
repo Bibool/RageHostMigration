@@ -1,0 +1,31 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Rage Host Migration",
+	"Description": "P2P host migration system. Caches replicated match state on every client, and elects a successor before the host drops, and rehosts or follows it when the host goes.",
+	"Category": "Networking",
+	"CreatedBy": "Abdallah 'Bib' Boutrif",
+	"CreatedByURL": "https://sk.linkedin.com/in/abdallah-boutrif-39488b190",
+	"DocsURL": "https://github.com/Bibool/RageHostMigration",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/Bibool/RageHostMigration",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "RageHostMigration",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "CommonLoadingScreen",
+			"Enabled": true,
+			"Optional": true
+		}
+	]
+}
