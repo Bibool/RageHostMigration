@@ -167,6 +167,13 @@ void ARageGameMode::InitGame(const FString& MapName, const FString& Options, FSt
 The plugin is game and type agnostic. Anything you want to survive rides a byte cache keyed by
 struct name, so any `USTRUCT` can go through it.
 
+>KEEP IN MIND:
+
+>- Asset references survive as their **path** and thus soft pointers come back pointing at the same asset.
+  References to *spawned* objects do not, because the actors on the new host are different actors. I recommend to store ids for those.
+>- The key is the struct's name, so one struct type is one slot. Two features sharing a struct type will overwrite each other.
+
+
 ```cpp
 // While the host is alive, whenever the state changes:
 URageHostMigrationSubsystem::CaptureExtraMatchStats(this, BuildMatchStatsSnapshot());
@@ -195,15 +202,155 @@ if (URageHostMigrationSubsystem::TryConsumeExtraPlayerStats(this, RagePlayerStat
 }
 ```
 
-KEEP IN MIND:
+## Tracking and restoring stats
 
-- Asset references survive as their **path** and thus soft pointers come back pointing at the same asset.
-  References to *spawned* objects do not, because the actors on the new host are different actors. I recommend to store ids for those.
-- The key is the struct's name, so one struct type is one slot. Two features sharing a struct type will overwrite each other.
+> API
+```cpp
+URageHostMigrationSubsystem::CaptureExtraMatchStats(WorldContext, Data);
+URageHostMigrationSubsystem::TryRestoreExtraMatchStats(WorldContext, OutData);
 
-**Capture anything time-sensitive from `HostMigrationStartedDelegate`, not from an OnRep.** A value
-mirrored on replication is only as fresh as the last time it replicated, which for a match clock is
-once, at the whistle.
+URageHostMigrationSubsystem::CaptureExtraPlayerStats(WorldContext, PlayerId, Data);
+URageHostMigrationSubsystem::TryRestoreExtraPlayerStats(WorldContext, PlayerId, OutData);
+URageHostMigrationSubsystem::TryConsumeExtraPlayerStats(WorldContext, PlayerId, OutData);  // reads then clears
+```
+
+Mostly what varies is **when you capture** and **where you restore**, and that follows from the three kind of state. 
+
+### Per player stats
+>Capture on change, restore in PostLogin
+
+Typically your PlayerState stats, such as Kills, Death, Assist, Score. These have to survive on *every* machine, because any of them might be
+the one that ends up hosting.
+
+I suggest to capture from the `OnRep`s, and make sure it happens for Auth too. A candidate that
+only ever cached its own stats comes up as host with an empty scoreboard for everyone else.
+
+```cpp
+void ARagePlayerState::MirrorStatsToSubsystem()
+{
+    const FRagePlayerStatsSnapshot Snapshot{
+        .Kills = Kills, .Deaths = Deaths, .Assists = Assists, .Score = GetScore(), .bWinner = bWinner};
+
+    URageHostMigrationSubsystem::CaptureExtraPlayerStats(this, GetUniqueId(), Snapshot);
+}
+```
+
+Restore as each survivor rejoins, not once at match start as players trickle back in over several
+seconds and each arrival needs its own row put back:
+
+```cpp
+void ARageGameMode::OnRestoreMigratedPlayerStats(ARagePlayerState* NewPlayerState)
+{
+    FRagePlayerStatsSnapshot RestoredStats;
+    if (URageHostMigrationSubsystem::TryRestoreExtraPlayerStats(this, NewPlayerState->GetUniqueId(), RestoredStats))
+    {
+        NewPlayerState->ApplyPlayerStatsSnapshot(RestoredStats);
+    }
+}
+```
+
+Same for GAS attributes. Mirror them off the attribute changed delegate, and apply them
+through the ASC on the far side rather than writing the attribute set directly:
+
+```cpp
+void ARagePlayerState::MirrorAttributes()
+{
+    FRageAttributesSnapshot Snapshot;
+    Snapshot.Health = RageAbilitySystemComponent->GetNumericAttribute(URageAttributeSet::GetHealthAttribute());
+    Snapshot.Shield = RageAbilitySystemComponent->GetNumericAttribute(URageAttributeSet::GetShieldAttribute());
+    Snapshot.Energy = RageAbilitySystemComponent->GetNumericAttribute(URageAttributeSet::GetEnergyAttribute());
+
+    URageHostMigrationSubsystem::CaptureExtraPlayerStats(this, GetUniqueId(), Snapshot);
+}
+```
+
+### Transient state 
+> Capture at migration start, consume once
+
+Where a player's pawn was, and anything else that is only true at the instant the host leaves.
+Avoid capturing on tick, it's unnecessary work, instead us `HostMigrationStartedDelegate` instead,
+which fires before any travel while the old world is still alive.
+
+```cpp
+void ARagePlayerCharacter::HandleHostMigrationStarted()
+{
+    if (!IsLocallyControlled())
+    {
+        return;
+    }
+
+    URageHostMigrationSubsystem::CaptureExtraPlayerStats<FRagePlayerTransformSnapshot>(
+        this, RagePlayerState->GetUniqueId(), {GetActorLocation(), GetActorRotation()});
+}
+```
+
+Use `TryConsume` on the far side for anything that must not be applied twice if a player reconnects
+more than once:
+
+```cpp
+FRagePlayerTransformSnapshot Restored;
+if (URageHostMigrationSubsystem::TryConsumeExtraPlayerStats(this, RagePlayerState->GetUniqueId(), Restored))
+{
+    SetActorLocationAndRotation(Restored.Location, Restored.Rotation);
+}
+```
+
+### Match state 
+> Mirror it, but refresh anything time-derived on the way out
+
+Match clock, match state, match phase. Mirror from the GameState's `OnRep`s so every machine
+holds the same server-authored copy.
+
+It goes without saying that a value mirrored in OnRep is only as fresh as the last time replicated.
+A match deadline is written once, at the whistle, so a remainder computed in its `OnRep` is frozen at
+whatever the clock read a second into the match and migrating twenty minutes later restores a full
+clock. Re-mirror from the started delegate, which is the one instant the number has to be right:
+
+```cpp
+void ARageGameState::BeginPlay()
+{
+    Super::BeginPlay();
+
+    if (URageHostMigrationSubsystem* HostMigrationSubsystem = URageHostMigrationSubsystem::Get(this))
+    {
+        HostMigrationSubsystem->HostMigrationStartedDelegate.AddDynamic(this, &ARageGameState::HandleHostMigrationStarted);
+    }
+}
+
+void ARageGameState::HandleHostMigrationStarted()
+{
+    // GetServerWorldTimeSeconds keeps advancing locally off the last replicated value, so the
+    // remainder is still accurate with the host already gone.
+    MirrorMatchStatsToSubsystem();
+}
+```
+
+Store a **remainder**, not an absolute deadline. The new host's world clock starts from zero, so an
+absolute server time means nothing to it.
+
+Restore it once, before the match state machine runs, and make sure your match-start handler does not
+then reset what you just restored:
+
+```cpp
+void ARageGameMode::StartPlay()
+{
+    TryRestoreMatchStatsIfNeeded();   // sets bResumedFromMigration
+    Super::StartPlay();
+}
+
+void ARageGameMode::HandleMatchHasStarted()
+{
+    Super::HandleMatchHasStarted();
+
+    if (bResumedFromMigration)
+    {
+        bResumedFromMigration = false;
+        return;   // the restored clock is the whole story, do not stamp a fresh one over it
+    }
+
+    RageGameState->SetTargetTime(GetResolvedGameModeData().MatchTimeLimitSeconds);
+}
+```
 
 ```cpp
 HostMigrationSubsystem->HostMigrationStartedDelegate.AddDynamic(this, &ARageGameState::HandleHostMigrationStarted);
